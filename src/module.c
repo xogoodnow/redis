@@ -1,30 +1,9 @@
 /*
- * Copyright (c) 2016, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2016-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of the Redis Source Available License 2.0
+ * (RSALv2) or the Server Side Public License v1 (SSPLv1).
  */
 
 /* --------------------------------------------------------------------------
@@ -59,6 +38,7 @@
 #include "script.h"
 #include "call_reply.h"
 #include "hdr_histogram.h"
+#include "crc16_slottable.h"
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -545,9 +525,21 @@ void *RM_Calloc(size_t nmemb, size_t size) {
     return zcalloc_usable(nmemb*size,NULL);
 }
 
+/* Similar to RM_Calloc, but returns NULL in case of allocation failure, instead
+ * of panicking. */
+void *RM_TryCalloc(size_t nmemb, size_t size) {
+    return ztrycalloc_usable(nmemb*size,NULL);
+}
+
 /* Use like realloc() for memory obtained with RedisModule_Alloc(). */
 void* RM_Realloc(void *ptr, size_t bytes) {
     return zrealloc_usable(ptr,bytes,NULL);
+}
+
+/* Similar to RM_Realloc, but returns NULL in case of allocation failure,
+ * instead of panicking. */
+void *RM_TryRealloc(void *ptr, size_t bytes) {
+    return ztryrealloc_usable(ptr,bytes,NULL);
 }
 
 /* Use like free() for memory obtained by RedisModule_Alloc() and
@@ -2432,7 +2424,7 @@ void RM_Yield(RedisModuleCtx *ctx, int flags, const char *busy_reply) {
                     /* Release the GIL, yielding CPU to give the main thread an opportunity to start
                      * event processing, and then acquire the GIL again until the main thread releases it. */
                     moduleReleaseGIL();
-                    sched_yield();
+                    usleep(0);
                     moduleAcquireGIL();
                 }
             } else {
@@ -4283,7 +4275,7 @@ void RM_ResetDataset(int restart_aof, int async) {
 
 /* Returns the number of keys in the current db. */
 unsigned long long RM_DbSize(RedisModuleCtx *ctx) {
-    return dbSize(ctx->client->db, DB_MAIN);
+    return dbSize(ctx->client->db);
 }
 
 /* Returns a name of a random key, or NULL if current db is empty. */
@@ -7686,6 +7678,13 @@ void RM_LatencyAddSample(const char *event, mstime_t latency) {
  * https://redis.io/topics/modules-blocking-ops.
  * -------------------------------------------------------------------------- */
 
+/* Returns 1 if the client already in the moduleUnblocked list, 0 otherwise. */
+int isModuleClientUnblocked(client *c) {
+    RedisModuleBlockedClient *bc = c->bstate.module_blocked_handle;
+
+    return bc->unblocked == 1;
+}
+
 /* This is called from blocked.c in order to unblock a client: may be called
  * for multiple reasons while the client is in the middle of being blocked
  * because the client is terminated, but is also called for cleanup when a
@@ -7790,15 +7789,15 @@ RedisModuleBlockedClient *moduleBlockClient(RedisModuleCtx *ctx, RedisModuleCmdF
     bc->background_timer = 0;
     bc->background_duration = 0;
 
-    c->bstate.timeout = 0;
+    mstime_t timeout = 0;
     if (timeout_ms) {
         mstime_t now = mstime();
-        if  (timeout_ms > LLONG_MAX - now) {
+        if (timeout_ms > LLONG_MAX - now) {
             c->bstate.module_blocked_handle = NULL;
             addReplyError(c, "timeout is out of range"); /* 'timeout_ms+now' would overflow */
             return bc;
         }
-        c->bstate.timeout = timeout_ms + now;
+        timeout = timeout_ms + now;
     }
 
     if (islua || ismulti) {
@@ -7814,8 +7813,9 @@ RedisModuleBlockedClient *moduleBlockClient(RedisModuleCtx *ctx, RedisModuleCmdF
         addReplyError(c, "Clients undergoing module based authentication can only be blocked on auth");
     } else {
         if (keys) {
-            blockForKeys(c,BLOCKED_MODULE,keys,numkeys,c->bstate.timeout,flags&REDISMODULE_BLOCK_UNBLOCK_DELETED);
+            blockForKeys(c,BLOCKED_MODULE,keys,numkeys,timeout,flags&REDISMODULE_BLOCK_UNBLOCK_DELETED);
         } else {
+            c->bstate.timeout = timeout;
             blockClient(c,BLOCKED_MODULE);
         }
     }
@@ -8425,7 +8425,12 @@ void moduleBlockedClientTimedOut(client *c, int from_module) {
     if (!from_module)
         prev_error_replies = server.stat_total_error_replies;
 
-    bc->timeout_callback(&ctx,(void**)c->argv,c->argc);
+    if (bc->timeout_callback) {
+        /* In theory, the user should always pass the timeout handler as an
+         * argument, but better to be safe than sorry. */
+        bc->timeout_callback(&ctx,(void**)c->argv,c->argc);
+    }
+
     moduleFreeContext(&ctx);
 
     if (!from_module)
@@ -9080,6 +9085,19 @@ void RM_SetClusterFlags(RedisModuleCtx *ctx, uint64_t flags) {
         server.cluster_module_flags |= CLUSTER_MODULE_FLAG_NO_FAILOVER;
     if (flags & REDISMODULE_CLUSTER_FLAG_NO_REDIRECTION)
         server.cluster_module_flags |= CLUSTER_MODULE_FLAG_NO_REDIRECTION;
+}
+
+/* Returns the cluster slot of a key, similar to the `CLUSTER KEYSLOT` command.
+ * This function works even if cluster mode is not enabled. */
+unsigned int RM_ClusterKeySlot(RedisModuleString *key) {
+    return keyHashSlot(key->ptr, sdslen(key->ptr));
+}
+
+/* Returns a short string that can be used as a key or as a hash tag in a key,
+ * such that the key maps to the given cluster slot. Returns NULL if slot is not
+ * a valid slot. */
+const char *RM_ClusterCanonicalKeyNameInSlot(unsigned int slot) {
+    return (slot < CLUSTER_SLOTS) ? crc16_slot_table[slot] : NULL;
 }
 
 /* --------------------------------------------------------------------------
@@ -11033,7 +11051,7 @@ int RM_Scan(RedisModuleCtx *ctx, RedisModuleScanCursor *cursor, RedisModuleScanC
     }
     int ret = 1;
     ScanCBData data = { ctx, privdata, fn };
-    cursor->cursor = dbScan(ctx->client->db, DB_MAIN, cursor->cursor, -1, moduleScanCallback, NULL, &data);
+    cursor->cursor = dbScan(ctx->client->db, cursor->cursor, moduleScanCallback, &data);
     if (cursor->cursor == 0) {
         cursor->done = 1;
         ret = 0;
@@ -13590,7 +13608,9 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(Alloc);
     REGISTER_API(TryAlloc);
     REGISTER_API(Calloc);
+    REGISTER_API(TryCalloc);
     REGISTER_API(Realloc);
+    REGISTER_API(TryRealloc);
     REGISTER_API(Free);
     REGISTER_API(Strdup);
     REGISTER_API(CreateCommand);
@@ -13817,6 +13837,8 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(SetDisconnectCallback);
     REGISTER_API(GetBlockedClientHandle);
     REGISTER_API(SetClusterFlags);
+    REGISTER_API(ClusterKeySlot);
+    REGISTER_API(ClusterCanonicalKeyNameInSlot);
     REGISTER_API(CreateDict);
     REGISTER_API(FreeDict);
     REGISTER_API(DictSize);

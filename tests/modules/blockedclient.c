@@ -90,6 +90,7 @@ int acquire_gil(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
     pthread_t tid;
     int res = pthread_create(&tid, NULL, worker, bc);
     assert(res == 0);
+    pthread_detach(tid);
 
     return REDISMODULE_OK;
 }
@@ -195,6 +196,7 @@ int do_bg_rm_call(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
     pthread_t tid;
     int res = pthread_create(&tid, NULL, bg_call_worker, bg);
     assert(res == 0);
+    pthread_detach(tid);
 
     return REDISMODULE_OK;
 }
@@ -344,6 +346,7 @@ static void rm_call_async_reply_on_thread(RedisModuleCtx *ctx, RedisModuleCallRe
     pthread_t tid;
     int res = pthread_create(&tid, NULL, send_async_reply, ta_rm_call_ctx);
     assert(res == 0);
+    pthread_detach(tid);
 }
 
 /*
@@ -629,16 +632,23 @@ static void timer_callback(RedisModuleCtx *ctx, void *data)
     RedisModule_FreeThreadSafeContext(reply_ctx);
 }
 
+/* unblock_by_timer <period_ms> <timeout_ms>
+ * period_ms is the period of the timer.
+ * timeout_ms is the blocking timeout. */
 int unblock_by_timer(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
 {
-    if (argc != 2)
+    if (argc != 3)
         return RedisModule_WrongArity(ctx);
 
     long long period;
+    long long timeout;
     if (RedisModule_StringToLongLong(argv[1],&period) != REDISMODULE_OK)
         return RedisModule_ReplyWithError(ctx,"ERR invalid period");
+    if (RedisModule_StringToLongLong(argv[2],&timeout) != REDISMODULE_OK) {
+        return RedisModule_ReplyWithError(ctx,"ERR invalid timeout");
+    }
 
-    RedisModuleBlockedClient *bc = RedisModule_BlockClient(ctx, NULL, NULL, NULL, 0);
+    RedisModuleBlockedClient *bc = RedisModule_BlockClient(ctx, NULL, NULL, NULL, timeout);
     RedisModule_CreateTimer(ctx, period, timer_callback, bc);
     return REDISMODULE_OK;
 }
